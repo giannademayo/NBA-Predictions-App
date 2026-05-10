@@ -11,7 +11,10 @@ data/interim/
 data/processed/
 kaggle.json
 
-# Generated artifacts. You may remove these lines if you intentionally want to deploy with artifacts.
-artifacts/*.joblib
+# Large/generated artifacts
 artifacts/*.parquet
-artifacts/*.csv
+
+# Keep deployable app artifacts
+!artifacts/.gitkeep
+!artifacts/model_bundle.joblib
+!artifacts/team_snapshot.csv

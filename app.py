@@ -50,6 +50,9 @@ if not MODEL_PATH.exists() or not SNAPSHOT_PATH.exists():
 bundle = get_bundle()
 snapshot = get_snapshot()
 labels = available_team_labels(snapshot)
+if len(labels) < 2:
+    st.error("Not enough teams are available in team_snapshot.csv.")
+    st.stop()
 
 with st.sidebar:
     st.header("Model artifacts")
@@ -73,10 +76,14 @@ with col2:
     rest_away = st.slider("Away rest days", 1, 14, 2)
 
 st.subheader("Optional Vegas comparison")
-odds_mode = st.radio("Odds input", ["None", "Direct no-vig home probability", "American moneylines"], horizontal=True)
+odds_mode = st.radio(
+    "Odds input",
+    ["None", "Direct Vegas-implied home probability", "American moneylines"],
+    horizontal=True,
+)
 vegas_home_prob = None
 
-if odds_mode == "Direct no-vig home probability":
+if odds_mode == "Direct Vegas-implied home probability":
     vegas_home_prob = st.slider("Vegas implied home probability", 0.01, 0.99, 0.55, 0.01)
 elif odds_mode == "American moneylines":
     c1, c2 = st.columns(2)

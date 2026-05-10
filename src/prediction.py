@@ -80,6 +80,7 @@ def load_bundle(path: str | Path = "artifacts/model_bundle.joblib") -> ModelBund
 def load_team_snapshot(path: str | Path = "artifacts/team_snapshot.csv") -> pd.DataFrame:
     """Load and validate the team-level feature snapshot used for matchup predictions."""
     snapshot = pd.read_csv(path)
+
     missing = [c for c in SNAPSHOT_COLUMNS if c not in snapshot.columns]
     if missing:
         raise ValueError(f"team_snapshot.csv is missing required columns: {missing}")
@@ -89,11 +90,32 @@ def load_team_snapshot(path: str | Path = "artifacts/team_snapshot.csv") -> pd.D
     out["team_name"] = out["team_name"].astype(str)
     out["abbreviation"] = out["abbreviation"].astype(str).str.upper()
 
-    numeric_cols = [c for c in SNAPSHOT_COLUMNS if c not in {"team_id", "team_name", "abbreviation"}]
+    numeric_cols = [
+        c for c in SNAPSHOT_COLUMNS
+        if c not in {"team_id", "team_name", "abbreviation"}
+    ]
+
     for col in numeric_cols:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    return out.dropna(subset=numeric_cols).reset_index(drop=True)
+    bad_rows = out[out[numeric_cols].isna().any(axis=1)]
+    if len(bad_rows) > 0:
+        teams = bad_rows["team_name"].tolist()
+        raise ValueError(
+            "team_snapshot.csv has missing numeric feature values for: "
+            f"{teams}"
+        )
+
+    if out["team_id"].duplicated().any():
+        dupes = out.loc[out["team_id"].duplicated(), "team_id"].tolist()
+        raise ValueError(f"team_snapshot.csv has duplicate team_id values: {dupes}")
+
+    if len(out) < 30:
+        raise ValueError(
+            f"team_snapshot.csv only has {len(out)} teams. Expected 30 NBA teams."
+        )
+
+    return out.sort_values("team_name").reset_index(drop=True)
 
 
 def team_label(row: pd.Series) -> str:
@@ -154,8 +176,8 @@ def make_matchup_features(
     if home["team_id"] == away["team_id"]:
         raise ValueError("Home and away teams must be different.")
 
-    rest_days_home = float(rest_days_home)
-    rest_days_away = float(rest_days_away)
+    rest_days_home = float(np.clip(rest_days_home, 1, 14))
+    rest_days_away = float(np.clip(rest_days_away, 1, 14))
 
     row = {
         "avg_elo_home": home["avg_elo"],
@@ -205,6 +227,9 @@ def predict_matchup(
     )
 
     features = features[bundle.feature_names]
+    if features.isna().any().any():
+        bad_cols = features.columns[features.isna().any()].tolist()
+        raise ValueError(f"Model input contains NaN values in: {bad_cols}")
     scaled = bundle.scaler.transform(features)
     home_prob = float(bundle.model.predict_proba(scaled)[0, 1])
 
@@ -244,11 +269,13 @@ def no_vig_home_probability(home_moneyline: float, away_moneyline: float) -> flo
 def betting_decision(home_prob: float, vegas_home_prob: float, threshold: float = 0.10) -> dict[str, Any]:
     """Compute home-team edge and the notebook's conservative home-bet signal."""
     edge = float(home_prob) - float(vegas_home_prob)
+    bet_home = edge >= threshold
+
     return {
         "edge": edge,
         "threshold": threshold,
-        "bet_home": edge > threshold,
-        "label": "BET HOME" if edge > threshold else "No home bet",
+        "bet_home": bet_home,
+        "label": "BET HOME" if bet_home else "No home bet",
     }
 
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from sklearn.frozen import FrozenEstimator
 
+from collections import defaultdict
 import joblib
 import kagglehub
 import numpy as np
@@ -108,7 +110,11 @@ def compute_player_elo(
     legacy_games: int = 400,
     decay_halflife: float = 365,
 ) -> pd.DataFrame:
-    """Compute the notebook's performance-weighted, inactivity-decayed player Elo."""
+    """Compute performance-weighted, inactivity-decayed player Elo.
+
+    Records both elo_before and elo_after so future pregame snapshots can use
+    only information available before a game.
+    """
     player_elo: dict[int, float] = {}
     player_games: dict[int, int] = {}
     player_peak_elo: dict[int, float] = {}
@@ -117,7 +123,8 @@ def compute_player_elo(
 
     for _, row in player_logs.iterrows():
         pid = int(row["PLAYER_ID"])
-        game_date = row["GAME_DATE"]
+        game_date = pd.Timestamp(row["GAME_DATE"])
+
         elo = player_elo.get(pid, default_elo)
         games_played = player_games.get(pid, 0)
         peak = player_peak_elo.get(pid, default_elo)
@@ -129,6 +136,16 @@ def compute_player_elo(
             elo = default_elo + (elo - default_elo) * decay
 
         actual = 1 if row["WL"] == "W" else 0
+        perf_weight = float(np.clip(row["perf_score"] / 30.0, 0.5, 2.5))
+        k_adjusted = k * perf_weight
+
+        expected = 1.0 / (1.0 + 10.0 ** ((default_elo - elo) / 400.0))
+        new_elo = elo + k_adjusted * (actual - expected)
+
+        if games_played > legacy_games:
+            floor = legacy_floor + (peak - legacy_floor) * 0.3
+            new_elo = max(new_elo, floor)
+
         records.append(
             {
                 "game_id": str(row["GAME_ID"]),
@@ -137,20 +154,12 @@ def compute_player_elo(
                 "team_id": str(row["TEAM_ID"]),
                 "game_date": game_date,
                 "elo_before": elo,
+                "elo_after": new_elo,
                 "peak_elo": peak,
                 "games_played": games_played,
                 "won": actual,
             }
         )
-
-        perf_weight = float(np.clip(row["perf_score"] / 30.0, 0.5, 2.5))
-        k_adjusted = k * perf_weight
-        expected = 1.0 / (1.0 + 10.0 ** ((default_elo - elo) / 400.0))
-        new_elo = elo + k_adjusted * (actual - expected)
-
-        if games_played > legacy_games:
-            floor = legacy_floor + (peak - legacy_floor) * 0.3
-            new_elo = max(new_elo, floor)
 
         player_elo[pid] = new_elo
         player_peak_elo[pid] = max(peak, new_elo)
@@ -172,6 +181,105 @@ def build_team_elo_per_game(elo_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
+def build_team_game_index(game: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per team-game: game_id, game_date, team_id."""
+    game_reg = game[game["season_type"] == "Regular Season"].copy()
+
+    home = game_reg[["game_id", "game_date", "team_id_home"]].rename(
+        columns={"team_id_home": "team_id"}
+    )
+    away = game_reg[["game_id", "game_date", "team_id_away"]].rename(
+        columns={"team_id_away": "team_id"}
+    )
+
+    team_games = pd.concat([home, away], ignore_index=True)
+    team_games["game_id"] = team_games["game_id"].astype(str)
+    team_games["team_id"] = team_games["team_id"].astype(str)
+    team_games["game_date"] = pd.to_datetime(team_games["game_date"], errors="coerce")
+
+    return team_games.sort_values(["game_date", "game_id", "team_id"]).reset_index(drop=True)
+
+
+def build_pregame_team_elo_snapshots(
+    elo_df: pd.DataFrame,
+    game: pd.DataFrame,
+    active_window_days: int = 365,
+    min_players: int = 5,
+) -> pd.DataFrame:
+    """Build team Elo features available before each game.
+
+    This avoids using the exact players who appeared in a game as the training feature.
+    Instead, for each game date, it uses each player's latest known postgame Elo before
+    that date and assigns the player to his latest known team.
+    """
+    if "elo_after" not in elo_df.columns:
+        raise ValueError("elo_df must include elo_after. Replace compute_player_elo() first.")
+
+    events = elo_df[
+        ["game_id", "game_date", "player_id", "team_id", "elo_after"]
+    ].copy()
+    events["game_date"] = pd.to_datetime(events["game_date"], errors="coerce")
+    events["team_id"] = events["team_id"].astype(str)
+    events = events.sort_values(["game_date", "game_id"]).reset_index(drop=True)
+
+    team_games = build_team_game_index(game)
+
+    rosters: dict[str, dict[int, tuple[float, pd.Timestamp]]] = defaultdict(dict)
+    latest_player_team: dict[int, str] = {}
+
+    records = []
+    e_i = 0
+    event_rows = events.to_dict("records")
+
+    for row in team_games.itertuples(index=False):
+        game_date = pd.Timestamp(row.game_date)
+        team_id = str(row.team_id)
+
+        # Only process player games strictly before this game date.
+        # This prevents day-of-game participant leakage.
+        while e_i < len(event_rows) and pd.Timestamp(event_rows[e_i]["game_date"]) < game_date:
+            ev = event_rows[e_i]
+            pid = int(ev["player_id"])
+            new_team = str(ev["team_id"])
+            elo_after = float(ev["elo_after"])
+            ev_date = pd.Timestamp(ev["game_date"])
+
+            old_team = latest_player_team.get(pid)
+            if old_team is not None and old_team != new_team:
+                rosters[old_team].pop(pid, None)
+
+            rosters[new_team][pid] = (elo_after, ev_date)
+            latest_player_team[pid] = new_team
+            e_i += 1
+
+        active_elos = [
+            elo
+            for elo, last_date in rosters[team_id].values()
+            if (game_date - last_date).days <= active_window_days
+        ]
+
+        if len(active_elos) < min_players:
+            avg_elo = np.nan
+            max_elo = np.nan
+            top5_elo = np.nan
+        else:
+            active_elos = pd.Series(active_elos)
+            avg_elo = active_elos.mean()
+            max_elo = active_elos.max()
+            top5_elo = active_elos.nlargest(5).mean()
+
+        records.append(
+            {
+                "game_id": str(row.game_id),
+                "team_id": team_id,
+                "avg_elo": avg_elo,
+                "max_elo": max_elo,
+                "top5_elo": top5_elo,
+                "num_players": len(active_elos),
+            }
+        )
+
+    return pd.DataFrame(records)
 
 def build_team_game_stats_from_sqlite(game: pd.DataFrame) -> pd.DataFrame:
     game_reg = game[game["season_type"] == "Regular Season"].sort_values("game_date").copy()
@@ -326,16 +434,52 @@ def build_training_features(
     return features.sort_values("game_date").reset_index(drop=True)
 
 
-def fit_scaled_calibrated_logit(X: pd.DataFrame, y: pd.Series) -> tuple[StandardScaler, CalibratedClassifierCV]:
+def fit_scaled_temporal_calibrated_logit(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series | None = None,
+    calib_fraction: float = 0.15,
+) -> tuple[StandardScaler, CalibratedClassifierCV]:
+    """Fit logistic regression with chronological holdout calibration.
+
+    Trains the base logistic regression on earlier rows and calibrates it on
+    later rows. This keeps model fitting and calibration temporally separated.
+    """
+    work = X.copy()
+    work["_y"] = y.to_numpy()
+
+    if dates is not None:
+        work["_date"] = pd.to_datetime(dates, errors="coerce").to_numpy()
+        work = work.sort_values("_date").reset_index(drop=True)
+    else:
+        work = work.reset_index(drop=True)
+
+    split_idx = int(len(work) * (1 - calib_fraction))
+    if split_idx <= 0 or split_idx >= len(work):
+        raise ValueError("Invalid calibration split. Need more rows.")
+
+    base = work.iloc[:split_idx]
+    calib = work.iloc[split_idx:]
+
+    X_base = base[X.columns]
+    y_base = base["_y"]
+    X_calib = calib[X.columns]
+    y_calib = calib["_y"]
+
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = CalibratedClassifierCV(
-        estimator=LogisticRegression(max_iter=1000),
+    X_base_scaled = scaler.fit_transform(X_base)
+    X_calib_scaled = scaler.transform(X_calib)
+
+    base_model = LogisticRegression(max_iter=1000)
+    base_model.fit(X_base_scaled, y_base)
+
+    calibrated_model = CalibratedClassifierCV(
+        estimator=FrozenEstimator(base_model),
         method="sigmoid",
-        cv=5,
     )
-    model.fit(X_scaled, y)
-    return scaler, model
+    calibrated_model.fit(X_calib_scaled, y_calib)
+
+    return scaler, calibrated_model
 
 
 def evaluate_temporal_split(model_df: pd.DataFrame, split_date: str = "2022-10-01") -> tuple[dict, StandardScaler, CalibratedClassifierCV]:
@@ -346,7 +490,12 @@ def evaluate_temporal_split(model_df: pd.DataFrame, split_date: str = "2022-10-0
     X_test = model_df.loc[test_mask, TOP_FEATURES]
     y_test = model_df.loc[test_mask, "home_win"]
 
-    scaler, model = fit_scaled_calibrated_logit(X_train, y_train)
+    scaler, model = fit_scaled_temporal_calibrated_logit(
+        X_train,
+        y_train,
+        dates=model_df.loc[train_mask, "game_date"],
+        calib_fraction=0.15,
+    )
     probs = model.predict_proba(scaler.transform(X_test))[:, 1]
     preds = (probs >= 0.5).astype(int)
 
@@ -387,15 +536,10 @@ def build_team_snapshot(
     """
     team_names = build_team_name_map(game)
 
-    latest_players = elo_df.sort_values("game_date").groupby("player_id", as_index=False).tail(1)
-    elo_snapshot = (
-        latest_players.groupby("team_id")
-        .agg(
-            avg_elo=("elo_before", "mean"),
-            top5_elo=("elo_before", lambda x: x.nlargest(5).mean()),
-            max_elo=("elo_before", "max"),
-        )
-        .reset_index()
+    elo_snapshot = build_current_elo_snapshot(
+        elo_df=elo_df,
+        active_window_days=365,
+        min_players=5,
     )
 
     latest_stats = team_game_stats_full.sort_values("game_date").groupby("team_id", as_index=False).tail(1)
@@ -475,7 +619,12 @@ def build_all_artifacts(
     print("Fetching player logs...")
     player_logs = clean_player_logs(fetch_league_game_logs(seasons, player_or_team="P"))
     elo_df = compute_player_elo(player_logs)
-    team_elo = build_team_elo_per_game(elo_df)
+    team_elo = build_pregame_team_elo_snapshots(
+        elo_df=elo_df,
+        game=game,
+        active_window_days=365,
+        min_players=5,
+    )
 
     print("Building historical team stats...")
     team_stats_sqlite = build_team_game_stats_from_sqlite(game)
@@ -490,18 +639,33 @@ def build_all_artifacts(
     metrics, _, _ = evaluate_temporal_split(model_df, split_date=evaluation_split_date)
 
     print("Training final calibrated logistic regression on all complete historical rows...")
-    scaler, model = fit_scaled_calibrated_logit(model_df[TOP_FEATURES], model_df["home_win"])
+    scaler, model = fit_scaled_temporal_calibrated_logit(
+        model_df[TOP_FEATURES],
+        model_df["home_win"],
+        dates=model_df["game_date"],
+        calib_fraction=0.15,
+    )
 
     print("Fetching team logs for current snapshot...")
     team_logs = clean_api_team_logs(fetch_league_game_logs(seasons, player_or_team="T"))
     team_logs_for_stats = team_logs.drop(columns=["wl"]).copy()
-    team_stats_full = pd.concat([team_stats_sqlite, team_logs_for_stats], ignore_index=True)
-    team_stats_full = add_rolling_team_stats(team_stats_full)
+    team_stats_full_raw = pd.concat(
+        [team_stats_sqlite, team_logs_for_stats],
+        ignore_index=True,
+    )
+    team_stats_full_raw = dedupe_team_game_rows(team_stats_full_raw)
+    team_stats_full = add_rolling_team_stats(team_stats_full_raw)
 
     wl_api = team_logs[["game_id", "game_date", "team_id", "wl"]].copy()
     wl_api["win"] = (wl_api["wl"] == "W").astype(int)
-    wl_full = add_win_rate_features(pd.concat([wl_sqlite[["game_id", "game_date", "team_id", "wl", "win"]], wl_api], ignore_index=True))
 
+    wl_full_raw = pd.concat(
+        [wl_sqlite[["game_id", "game_date", "team_id", "wl", "win"]], wl_api],
+        ignore_index=True,
+    )
+    wl_full_raw = dedupe_team_game_rows(wl_full_raw)
+    wl_full = add_win_rate_features(wl_full_raw)
+    
     snapshot = build_team_snapshot(game, elo_df, team_stats_full, wl_full)
 
     return PipelineOutputs(
@@ -511,6 +675,76 @@ def build_all_artifacts(
         scaler=scaler,
         model=model,
         metrics=metrics,
+    )
+
+
+def build_current_elo_snapshot(
+    elo_df: pd.DataFrame,
+    active_window_days: int = 365,
+    min_players: int = 5,
+) -> pd.DataFrame:
+    """Build current team Elo snapshot using recently active players only."""
+    if "elo_after" not in elo_df.columns:
+        raise ValueError("elo_df must include elo_after. Replace compute_player_elo() first.")
+
+    events = elo_df[
+        ["game_date", "player_id", "team_id", "elo_after"]
+    ].copy()
+    events["game_date"] = pd.to_datetime(events["game_date"], errors="coerce")
+    events["team_id"] = events["team_id"].astype(str)
+    events = events.sort_values("game_date")
+
+    latest_date = events["game_date"].max()
+
+    rosters: dict[str, dict[int, tuple[float, pd.Timestamp]]] = defaultdict(dict)
+    latest_player_team: dict[int, str] = {}
+
+    for ev in events.itertuples(index=False):
+        pid = int(ev.player_id)
+        new_team = str(ev.team_id)
+
+        old_team = latest_player_team.get(pid)
+        if old_team is not None and old_team != new_team:
+            rosters[old_team].pop(pid, None)
+
+        rosters[new_team][pid] = (float(ev.elo_after), pd.Timestamp(ev.game_date))
+        latest_player_team[pid] = new_team
+
+    rows = []
+    for team_id, players in rosters.items():
+        active_elos = [
+            elo
+            for elo, last_date in players.values()
+            if (latest_date - last_date).days <= active_window_days
+        ]
+
+        if len(active_elos) < min_players:
+            continue
+
+        active_elos = pd.Series(active_elos)
+        rows.append(
+            {
+                "team_id": str(team_id),
+                "avg_elo": active_elos.mean(),
+                "top5_elo": active_elos.nlargest(5).mean(),
+                "max_elo": active_elos.max(),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def dedupe_team_game_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate team-game rows before rolling calculations."""
+    out = df.copy()
+    out["game_id"] = out["game_id"].astype(str)
+    out["team_id"] = out["team_id"].astype(str)
+    out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+
+    return (
+        out.sort_values(["team_id", "game_date", "game_id"])
+        .drop_duplicates(subset=["game_id", "team_id"], keep="last")
+        .reset_index(drop=True)
     )
 
 
