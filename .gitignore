@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+
+# Do not commit raw data or API credentials
+data/raw/
+data/interim/
+data/processed/
+kaggle.json
+
+# Generated artifacts. You may remove these lines if you intentionally want to deploy with artifacts.
+artifacts/*.joblib
+artifacts/*.parquet
+artifacts/*.csv
