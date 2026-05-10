@@ -1,9 +1,9 @@
 """
-app.py  —  NBA Win Probability & Betting Edge
+app2.py  —  NBA Win Probability & Betting Edge
 IEOR 142A — Spring 2026
 
 Run:
-    streamlit run app.py
+    streamlit run app2.py
 """
 
 from __future__ import annotations
@@ -87,10 +87,9 @@ with st.sidebar:
 
     st.markdown(f"**Algorithm:** {bundle.metadata.get('model_type', 'Calibrated logistic regression')}")
     st.markdown(
-        "**Features:** Player Elo (performance-weighted K-factor, "
-        "inactivity decay, legacy floor), team avg/top-5/max Elo, "
-        "rolling 10-game pts/±/FG%/3P%/FT%/reb/ast/tov, "
-        "L5 & L20 win rate, rest days"
+        "**Features:** Player Elo, team avg/top-5/max Elo, "
+        "rolling 10-game points and plus-minus, "
+        "L5/L20 win-rate momentum, and rest days."
     )
 
     if metrics:
@@ -114,7 +113,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Vegas lines achieve ~67% accuracy — a strong baseline. "
+        "Betting markets are a strong benchmark. "
         "This tool is for class purposes only, not betting advice."
     )
 
@@ -185,7 +184,7 @@ if vegas_home_prob is not None:
 
 # ── Predict ────────────────────────────────────────────────────────────────────
 st.divider()
-if st.button("🔮 Predict", type="primary", use_container_width=True):
+if st.button("🔮 Predict", type="primary", width="stretch"):
     try:
         result = predict_matchup(
             bundle=bundle,
@@ -306,12 +305,12 @@ if st.button("🔮 Predict", type="primary", use_container_width=True):
             },
         ]
     )
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(summary, width="stretch", hide_index=True)
 
     with st.expander("Raw model feature vector"):
         st.dataframe(
             pd.DataFrame([result["features"]]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -355,7 +354,7 @@ with st.expander("📊 Explore the data"):
         display["L20 win%"] = display["L20 win%"].map(lambda x: f"{x:.0%}")
         for col in ["Avg Elo", "Top-5 Elo", "Max Elo"]:
             display[col] = display[col].round(1)
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width="stretch", hide_index=True)
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.divider()
